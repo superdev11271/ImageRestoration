@@ -13,28 +13,193 @@ import os
 import sys
 
 import cv2
+import torch
+import torch.nn.functional as F
+import torchvision.transforms as transforms
+import torchvision.transforms.functional as TF
 
-from restoration_net import RestorationNet
-from scratch_detector import ScratchDetector
+from detection_models import networks as detection_networks
+from models.mapping_model import Pix2PixHDModel_Mapping
+from options.test_options import TestOptions
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+
+
+def resize_to_multiple(image, base=16, interpolation=cv2.INTER_CUBIC):
+    """Round both sides of an image array to a multiple of `base`.
+
+    Both networks only need their input divisible by a power of two (4 for the
+    restoration generators, 16 for the detection UNet), so rounding to 16
+    satisfies both.
+    """
+    oh, ow = image.shape[:2]
+    w = int(round(ow / base) * base)
+    h = int(round(oh / base) * base)
+    if (w, h) == (ow, oh):
+        return image
+    return cv2.resize(image, (w, h), interpolation=interpolation)
+
+
+def scale_short_side(img_tensor, default_scale=256):
+    """Resize so the shorter side is `default_scale`, keeping the aspect ratio."""
+    _, _, h, w = img_tensor.shape
+    if h < w:
+        oh = default_scale
+        ow = w / h * default_scale
+    else:
+        ow = default_scale
+        oh = h / w * default_scale
+
+    oh = int(round(oh / 16) * 16)
+    ow = int(round(ow / 16) * 16)
+    return F.interpolate(img_tensor, [oh, ow], mode="bilinear")
+
+
+def dilate_mask(mask, iterations):
+    """Binary dilation of a mask tensor.
+
+    `iterations` passes of a 3x3 rectangular kernel grow the mask by the same
+    amount as one (2 * iterations + 1) square, which is a single max-pool.
+    """
+    size = 2 * iterations + 1
+    return F.max_pool2d(mask, size, stride=1, padding=iterations)
 
 
 class ImageRestorer:
     """Old-photo restoration for a single BGR image."""
 
-    def __init__(self, HR=False, GPU=0):
+    def __init__(self, with_scratch=False, HR=False, GPU=0):
+        self.with_scratch = with_scratch
         self.HR = HR
         self.GPU = GPU
 
-        self.detector = ScratchDetector(GPU=GPU)
-        # the mapping model differs per mode, so both variants are loaded
-        self.restoration_quality = RestorationNet(False, HR=HR, GPU=GPU)
-        self.restoration_scratch = RestorationNet(True, HR=HR, GPU=GPU)
+        self.opt = self._build_opt()
 
-    def inference(self, image, with_scratch=False):
+        self.detection_net = self._load_detection_net() if with_scratch else None
+
+        self.model = Pix2PixHDModel_Mapping()
+        self.model.initialize(self.opt)
+        self.model.eval()
+
+        self.img_transform = transforms.Compose(
+            [transforms.ToTensor(), transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))]
+        )
+
+    ## ---------------------------------------------------------------- setup
+
+    def _build_opt(self):
+        """Build the same option namespace run.py would produce on the CLI."""
+        saved_argv = sys.argv
+        sys.argv = [saved_argv[0], "--gpu_ids", str(self.GPU)]
+        try:
+            opt = TestOptions().parse(save=False)
+        finally:
+            sys.argv = saved_argv
+
+        # same settings test.py's parameter_set() applies
+        opt.serial_batches = True
+        opt.no_flip = True
+        opt.label_nc = 0
+        opt.n_downsample_global = 3
+        opt.mc = 64
+        opt.k_size = 4
+        opt.start_r = 1
+        opt.mapping_n_block = 6
+        opt.map_mc = 512
+        opt.no_instance = True
+        opt.checkpoints_dir = os.path.join(HERE, "checkpoints", "restoration")
+        opt.load_pretrainA = os.path.join(opt.checkpoints_dir, "VAE_A_quality")
+
+        if self.with_scratch:
+            opt.NL_res = True
+            opt.use_SN = True
+            opt.correlation_renormalize = True
+            opt.NL_use_mask = True
+            opt.NL_fusion_method = "combine"
+            opt.non_local = "Setting_42"
+            opt.name = "mapping_scratch"
+            opt.load_pretrainB = os.path.join(opt.checkpoints_dir, "VAE_B_scratch")
+            if self.HR:
+                opt.mapping_exp = 1
+                opt.inference_optimize = True
+                opt.mask_dilation = 3
+                opt.name = "mapping_Patch_Attention"
+        else:
+            opt.name = "mapping_quality"
+            opt.load_pretrainB = os.path.join(opt.checkpoints_dir, "VAE_B_quality")
+
+        return opt
+
+    def _load_detection_net(self):
+        net = detection_networks.UNet(
+            in_channels=1,
+            out_channels=1,
+            depth=4,
+            conv_num=2,
+            wf=6,
+            padding=True,
+            batch_norm=True,
+            up_mode="upsample",
+            with_tanh=False,
+            sync_bn=True,
+            antialiasing=True,
+        )
+        checkpoint = torch.load(
+            os.path.join(HERE, "checkpoints", "detection", "FT_Epoch_latest.pt"), map_location="cpu"
+        )
+        net.load_state_dict(checkpoint["model_state"])
+        if self.GPU >= 0:
+            net.to(self.GPU)
+        else:
+            net.cpu()
+        net.eval()
+        return net
+
+    ## ------------------------------------------------------------ pipeline
+
+    def preprocess(self, image):
+        """BGR uint8 image -> (input tensor, mask tensor) ready for the model."""
+        rgb = resize_to_multiple(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
+        input_tensor = self.img_transform(rgb).unsqueeze(0)
+
+        if not self.with_scratch:
+            return input_tensor, torch.zeros_like(input_tensor)
+
+        mask = self._detect_scratch(input_tensor)
+        if self.opt.mask_dilation != 0:
+            mask = dilate_mask(mask, self.opt.mask_dilation)
+
+        # paint the scratches white; 255 is 1.0 once normalized to [-1, 1]
+        return input_tensor * (1 - mask) + mask, mask
+
+    def _detect_scratch(self, input_tensor):
+        """Run the detection UNet, returning a binary 0/1 mask of shape (1, 1, H, W)."""
+        # luma weights sum to ~1, so this works directly on the normalized tensor
+        gray = TF.rgb_to_grayscale(input_tensor)
+        _, _, h, w = gray.shape
+
+        scaled = scale_short_side(gray)
+        scaled = scaled.to(self.GPU) if self.GPU >= 0 else scaled.cpu()
+        with torch.no_grad():
+            P = torch.sigmoid(self.detection_net(scaled))
+
+        P = F.interpolate(P.data.cpu(), [h, w], mode="nearest")
+        return (P >= 0.4).float()
+
+    def inference(self, image):
         """BGR uint8 image in, restored BGR uint8 image out."""
-        if with_scratch:
-            return self.restoration_scratch.restore(image, self.detector.detect(image))
-        return self.restoration_quality.restore(image)
+        input_tensor, mask_tensor = self.preprocess(image)
+        with torch.no_grad():
+            generated = self.model.inference(input_tensor, mask_tensor)
+        return self.postprocess(generated)
+
+    def postprocess(self, generated):
+        """Model output -> BGR uint8, matching save_image(..., normalize=True)."""
+        img = ((generated.data.cpu() + 1.0) / 2.0).squeeze(0)
+        low, high = float(img.min()), float(img.max())
+        img = img.clamp_(min=low, max=high).sub_(low).div_(max(high - low, 1e-5))
+        array = img.mul(255).add_(0.5).clamp_(0, 255).permute(1, 2, 0).numpy().astype("uint8")
+        return cv2.cvtColor(array, cv2.COLOR_RGB2BGR)
 
 
 if __name__ == "__main__":
@@ -49,8 +214,8 @@ if __name__ == "__main__":
     if image is None:
         sys.exit("Could not read image: %s" % args.input)
 
-    restorer = ImageRestorer(HR=args.HR, GPU=args.GPU)
-    result = restorer.inference(image, with_scratch=args.with_scratch)
+    restorer = ImageRestorer(with_scratch=args.with_scratch, HR=args.HR, GPU=args.GPU)
+    result = restorer.inference(image)
 
     root, ext = os.path.splitext(args.input)
     output_path = root + "_out" + ext
