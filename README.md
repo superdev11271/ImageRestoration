@@ -108,6 +108,31 @@ output/
     └── mask/         # predicted scratch mask
 ```
 
+## Single-image API
+
+`inference.py` loads both networks once and restores an image held in memory,
+instead of spawning a subprocess per directory the way `run.py` does:
+
+```python
+import cv2
+from inference import ImageRestorer
+
+restorer = ImageRestorer(with_scratch=True, HR=False, GPU=0)   # GPU=-1 for CPU
+result = restorer.inference(cv2.imread("test_images/a.png"))   # BGR in, BGR out
+cv2.imwrite("test_images/a_out.png", result)
+```
+
+`inference()` chains `preprocess()` (resize, scratch detection, hole
+synthesis, normalization), the network forward pass, and `postprocess()`
+(denormalize to a BGR `uint8` array). It can also be run directly:
+
+```bash
+python inference.py --input ./test_images/a.png --GPU 0 --with_scratch
+```
+
+The result is written next to the input with an `_out` suffix
+(`test_images/a_out.png`).
+
 ## Running the stages directly
 
 ```bash
@@ -132,6 +157,7 @@ also lists `resize_256`, but `data_transforms` in `detection.py` does not handle
 | `run.py` | End-to-end driver |
 | `detection.py` | Scratch-detection inference |
 | `test.py` | Restoration inference |
+| `inference.py` | Single-image `ImageRestorer` class (both stages in one process) |
 | `detection_models/` | UNet + synchronized batch norm for detection |
 | `detection_util/` | Helpers used by `detection.py` |
 | `models/` | pix2pixHD / VAE / feature-mapping networks |
