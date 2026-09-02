@@ -1,0 +1,13 @@
+# Python 3.12 tested. Install PyTorch first if you need a specific CUDA build:
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu126
+
+torch>=2.0
+torchvision>=0.15
+numpy>=1.24
+opencv-python>=4.5
+Pillow>=9.0
+
+# Required by detection_util/util.py (imported by detection.py)
+PyYAML>=6.0
+easydict>=1.9
+matplotlib>=3.5
