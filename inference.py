@@ -13,9 +13,9 @@ import os
 import sys
 
 import cv2
+import numpy as np
 import torch
 import torch.nn.functional as F
-import torchvision.transforms as transforms
 import torchvision.transforms.functional as TF
 
 from detection_models import networks as detection_networks
@@ -68,22 +68,17 @@ def dilate_mask(mask, iterations):
 class ImageRestorer:
     """Old-photo restoration for a single BGR image."""
 
-    def __init__(self, with_scratch=False, HR=False, GPU=0):
-        self.with_scratch = with_scratch
+    def __init__(self, HR=False, GPU=0):
         self.HR = HR
         self.GPU = GPU
 
         self.opt = self._build_opt()
 
-        self.detection_net = self._load_detection_net() if with_scratch else None
+        self.detection_net = self._load_detection_net()
 
         self.model = Pix2PixHDModel_Mapping()
         self.model.initialize(self.opt)
         self.model.eval()
-
-        self.img_transform = transforms.Compose(
-            [transforms.ToTensor(), transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))]
-        )
 
     ## ---------------------------------------------------------------- setup
 
@@ -110,23 +105,19 @@ class ImageRestorer:
         opt.checkpoints_dir = os.path.join(HERE, "checkpoints", "restoration")
         opt.load_pretrainA = os.path.join(opt.checkpoints_dir, "VAE_A_quality")
 
-        if self.with_scratch:
-            opt.NL_res = True
-            opt.use_SN = True
-            opt.correlation_renormalize = True
-            opt.NL_use_mask = True
-            opt.NL_fusion_method = "combine"
-            opt.non_local = "Setting_42"
-            opt.name = "mapping_scratch"
-            opt.load_pretrainB = os.path.join(opt.checkpoints_dir, "VAE_B_scratch")
-            if self.HR:
-                opt.mapping_exp = 1
-                opt.inference_optimize = True
-                opt.mask_dilation = 3
-                opt.name = "mapping_Patch_Attention"
-        else:
-            opt.name = "mapping_quality"
-            opt.load_pretrainB = os.path.join(opt.checkpoints_dir, "VAE_B_quality")
+        opt.NL_res = True
+        opt.use_SN = True
+        opt.correlation_renormalize = True
+        opt.NL_use_mask = True
+        opt.NL_fusion_method = "combine"
+        opt.non_local = "Setting_42"
+        opt.name = "mapping_scratch"
+        opt.load_pretrainB = os.path.join(opt.checkpoints_dir, "VAE_B_scratch")
+        if self.HR:
+            opt.mapping_exp = 1
+            opt.inference_optimize = True
+            opt.mask_dilation = 3
+            opt.name = "mapping_Patch_Attention"
 
         return opt
 
@@ -158,19 +149,22 @@ class ImageRestorer:
     ## ------------------------------------------------------------ pipeline
 
     def preprocess(self, image):
-        """BGR uint8 image -> (input tensor, mask tensor) ready for the model."""
+        """BGR uint8 image -> RGB float32 HWC array normalized to [-1, 1]."""
         rgb = resize_to_multiple(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
-        input_tensor = self.img_transform(rgb).unsqueeze(0)
+        return rgb.astype(np.float32) / 127.5 - 1.0
 
-        if not self.with_scratch:
-            return input_tensor, torch.zeros_like(input_tensor)
-
+    def run_model(self, input_tensor):
+        """(1, 3, H, W) normalized RGB tensor in, raw model output tensor out."""
         mask = self._detect_scratch(input_tensor)
         if self.opt.mask_dilation != 0:
             mask = dilate_mask(mask, self.opt.mask_dilation)
 
         # paint the scratches white; 255 is 1.0 once normalized to [-1, 1]
-        return input_tensor * (1 - mask) + mask, mask
+        masked = input_tensor * (1 - mask) + mask
+
+        with torch.no_grad():
+            generated = self.model.inference(masked, mask)
+        return generated.data.cpu()
 
     def _detect_scratch(self, input_tensor):
         """Run the detection UNet, returning a binary 0/1 mask of shape (1, 1, H, W)."""
@@ -188,25 +182,24 @@ class ImageRestorer:
 
     def inference(self, image):
         """BGR uint8 image in, restored BGR uint8 image out."""
-        input_tensor, mask_tensor = self.preprocess(image)
-        with torch.no_grad():
-            generated = self.model.inference(input_tensor, mask_tensor)
-        return self.postprocess(generated)
+        array = self.preprocess(image)
+        input_tensor = torch.from_numpy(array).permute(2, 0, 1).unsqueeze(0)
+        generated = self.run_model(input_tensor)
+        return self.postprocess(generated.squeeze(0).permute(1, 2, 0).numpy())
 
-    def postprocess(self, generated):
+    def postprocess(self, array):
         """Model output -> BGR uint8, matching save_image(..., normalize=True)."""
-        img = ((generated.data.cpu() + 1.0) / 2.0).squeeze(0)
+        img = (array + 1.0) / 2.0
         low, high = float(img.min()), float(img.max())
-        img = img.clamp_(min=low, max=high).sub_(low).div_(max(high - low, 1e-5))
-        array = img.mul(255).add_(0.5).clamp_(0, 255).permute(1, 2, 0).numpy().astype("uint8")
-        return cv2.cvtColor(array, cv2.COLOR_RGB2BGR)
+        img = (np.clip(img, low, high) - low) / max(high - low, 1e-5)
+        rgb = np.clip(img * 255 + 0.5, 0, 255).astype(np.uint8)
+        return cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--input", type=str, default="./test_images/a.png", help="Input image")
     parser.add_argument("--GPU", type=int, default=0, help="GPU id, -1 for CPU")
-    parser.add_argument("--with_scratch", action="store_true")
     parser.add_argument("--HR", action="store_true")
     args = parser.parse_args()
 
@@ -214,7 +207,7 @@ if __name__ == "__main__":
     if image is None:
         sys.exit("Could not read image: %s" % args.input)
 
-    restorer = ImageRestorer(with_scratch=args.with_scratch, HR=args.HR, GPU=args.GPU)
+    restorer = ImageRestorer(HR=args.HR, GPU=args.GPU)
     result = restorer.inference(image)
 
     root, ext = os.path.splitext(args.input)
