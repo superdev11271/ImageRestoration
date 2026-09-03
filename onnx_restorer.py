@@ -17,6 +17,9 @@ import cv2
 import numpy as np
 import onnxruntime as ort
 
+# what the graph's input tensor is declared as, and the numpy dtype to feed it
+INPUT_DTYPES = {"tensor(float)": np.float32, "tensor(float16)": np.float16}
+
 
 def resize_to_multiple(image, base=16, interpolation=cv2.INTER_CUBIC):
     """Round both sides of an image array to a multiple of `base`.
@@ -42,7 +45,11 @@ class OnnxImageRestorer:
             providers.insert(0, "CUDAExecutionProvider")
 
         self.session = ort.InferenceSession(model_path, providers=providers)
-        self.input_name = self.session.get_inputs()[0].name
+        model_input = self.session.get_inputs()[0]
+        self.input_name = model_input.name
+        if model_input.type not in INPUT_DTYPES:
+            raise ValueError("unsupported graph input type %s" % model_input.type)
+        self.dtype = INPUT_DTYPES[model_input.type]
 
     def preprocess(self, image):
         """BGR uint8 image -> RGB float32 HWC array normalized to [-1, 1]."""
@@ -73,15 +80,16 @@ class OnnxImageRestorer:
         results = [None] * len(arrays)
         for indices in groups.values():
             batch = np.stack([arrays[index] for index in indices]).transpose(0, 3, 1, 2)
-            generated = self.run_model(np.ascontiguousarray(batch))
+            # fp16 graphs want half input; preprocess always produces float32
+            generated = self.run_model(np.ascontiguousarray(batch, dtype=self.dtype))
             for slot, index in enumerate(indices):
                 # postprocess per image: it rescales by the image's own min/max
                 results[index] = self.postprocess(generated[slot].transpose(1, 2, 0))
         return results
 
     def postprocess(self, array):
-        """Model output -> BGR uint8, matching save_image(..., normalize=True)."""
-        img = (array + 1.0) / 2.0
+        """Model output (float32 or float16) -> BGR uint8, matching save_image(normalize=True)."""
+        img = (array.astype(np.float32) + 1.0) / 2.0
         low, high = float(img.min()), float(img.max())
         img = (np.clip(img, low, high) - low) / max(high - low, 1e-5)
         rgb = np.clip(img * 255 + 0.5, 0, 255).astype(np.uint8)
