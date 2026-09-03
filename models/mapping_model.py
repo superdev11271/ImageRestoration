@@ -326,10 +326,10 @@ class Pix2PixHDModel_Mapping(BaseModel):
 
         use_gpu = len(self.opt.gpu_ids) > 0
         if use_gpu:
-            input_concat = label.data.cuda()
+            input_concat = label.cuda()
             inst_data = inst.cuda()
         else:
-            input_concat = label.data
+            input_concat = label
             inst_data = inst
 
         label_feat = self.netG_A.forward(input_concat, flow="enc")

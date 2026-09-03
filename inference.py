@@ -41,18 +41,25 @@ def resize_to_multiple(image, base=16, interpolation=cv2.INTER_CUBIC):
 
 
 def scale_short_side(img_tensor, default_scale=256):
-    """Resize so the shorter side is `default_scale`, keeping the aspect ratio."""
-    _, _, h, w = img_tensor.shape
-    if h < w:
-        oh = default_scale
-        ow = w / h * default_scale
-    else:
-        ow = default_scale
-        oh = h / w * default_scale
+    """Resize so the shorter side is `default_scale`, keeping the aspect ratio.
 
-    oh = int(round(oh / 16) * 16)
-    ow = int(round(ow / 16) * 16)
-    return F.interpolate(img_tensor, [oh, ow], mode="bilinear")
+    The long side is integer arithmetic on the input's shape, which survives
+    ONNX export as int64 ops, so the exported graph handles any input size.
+    The `if` cannot: torch.export resolves it from the sample input, so an
+    exported graph assumes that sample's orientation (see export_onnx.py).
+    Keeping it as a branch is deliberate - hiding it in torch.cond makes the
+    result's size opaque and the detection UNet then fails to export.
+
+    The result is a multiple of 16, which the UNet's four downsampling steps
+    need.
+    """
+    h, w = img_tensor.shape[2], img_tensor.shape[3]
+    unit = default_scale // 16  # long side in units of 16: round(unit * long / short)
+    if h <= w:
+        size = [default_scale, (2 * unit * w + h) // (2 * h) * 16]
+    else:
+        size = [(2 * unit * h + w) // (2 * w) * 16, default_scale]
+    return F.interpolate(img_tensor, size, mode="bilinear")
 
 
 def dilate_mask(mask, iterations):
@@ -68,9 +75,9 @@ def dilate_mask(mask, iterations):
 class ImageRestorer:
     """Old-photo restoration for a single BGR image."""
 
-    def __init__(self, HR=False, GPU=0):
+    def __init__(self, HR=False, device="cuda"):
         self.HR = HR
-        self.GPU = GPU
+        self.device = device
 
         self.opt = self._build_opt()
 
@@ -85,7 +92,7 @@ class ImageRestorer:
     def _build_opt(self):
         """Build the same option namespace run.py would produce on the CLI."""
         saved_argv = sys.argv
-        sys.argv = [saved_argv[0], "--gpu_ids", str(self.GPU)]
+        sys.argv = [saved_argv[0], "--gpu_ids", "0" if self.device == "cuda" else "-1"]
         try:
             opt = TestOptions().parse(save=False)
         finally:
@@ -139,10 +146,7 @@ class ImageRestorer:
             os.path.join(HERE, "checkpoints", "detection", "FT_Epoch_latest.pt"), map_location="cpu"
         )
         net.load_state_dict(checkpoint["model_state"])
-        if self.GPU >= 0:
-            net.to(self.GPU)
-        else:
-            net.cpu()
+        net.to(self.device)
         net.eval()
         return net
 
@@ -164,20 +168,19 @@ class ImageRestorer:
 
         with torch.no_grad():
             generated = self.model.inference(masked, mask)
-        return generated.data.cpu()
+        return generated.cpu()
 
     def _detect_scratch(self, input_tensor):
         """Run the detection UNet, returning a binary 0/1 mask of shape (1, 1, H, W)."""
         # luma weights sum to ~1, so this works directly on the normalized tensor
         gray = TF.rgb_to_grayscale(input_tensor)
-        _, _, h, w = gray.shape
+        gray = gray.to(self.device)
+        h, w = input_tensor.shape[2], input_tensor.shape[3]
 
-        scaled = scale_short_side(gray)
-        scaled = scaled.to(self.GPU) if self.GPU >= 0 else scaled.cpu()
         with torch.no_grad():
-            P = torch.sigmoid(self.detection_net(scaled))
+            P = torch.sigmoid(self.detection_net(scale_short_side(gray)))
 
-        P = F.interpolate(P.data.cpu(), [h, w], mode="nearest")
+        P = F.interpolate(P.cpu(), [h, w], mode="nearest")
         return (P >= 0.4).float()
 
     def inference(self, image):
@@ -199,7 +202,7 @@ class ImageRestorer:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--input", type=str, default="./test_images/a.png", help="Input image")
-    parser.add_argument("--GPU", type=int, default=0, help="GPU id, -1 for CPU")
+    parser.add_argument("--device", type=str, default="cuda", choices=["cuda", "cpu"])
     parser.add_argument("--HR", action="store_true")
     args = parser.parse_args()
 
@@ -207,7 +210,7 @@ if __name__ == "__main__":
     if image is None:
         sys.exit("Could not read image: %s" % args.input)
 
-    restorer = ImageRestorer(HR=args.HR, GPU=args.GPU)
+    restorer = ImageRestorer(HR=args.HR, device=args.device)
     result = restorer.inference(image)
 
     root, ext = os.path.splitext(args.input)
