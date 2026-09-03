@@ -2,7 +2,7 @@
 
 Start with a model name and a device; the models always live in `MODEL_DIR`:
 
-    python server.py --model run_model.onnx --device cuda
+    python server.py --model run_model_fp16.onnx --device cuda
 
 POST an image (multipart field `image`) and get the restored image back as
 PNG. Images whose longest side exceeds `--max_side` are downscaled for
@@ -21,9 +21,9 @@ from fastapi.responses import Response
 from onnx_restorer import OnnxImageRestorer
 
 MODEL_DIR = 'checkpoints'
-DEFAULT_MODEL = 'run_model.onnx'
+DEFAULT_MODEL = 'run_model_fp16.onnx'
 DEFAULT_DEVICE = 'cuda'
-DEFAULT_MAX_SIDE = 1920
+DEFAULT_MAX_SIDE = 1280
 
 app = FastAPI(title='Image Restoration ONNX')
 restorer = None

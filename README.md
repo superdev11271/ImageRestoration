@@ -30,7 +30,7 @@ start the server with `--device cpu`.
 import cv2
 from onnx_restorer import OnnxImageRestorer
 
-restorer = OnnxImageRestorer('checkpoints/run_model.onnx', device='cuda')
+restorer = OnnxImageRestorer('checkpoints/run_model_fp16.onnx', device='cuda')
 output = restorer.inference(cv2.imread('input.png'))         # BGR uint8 in, BGR uint8 out
 outputs = restorer.infer_batch([img1, img2])                 # one session call per distinct size
 ```
@@ -48,14 +48,14 @@ outputs = restorer.infer_batch([img1, img2])                 # one session call 
 
 ```bash
 python server.py
-python server.py -m run_model_fp16.onnx -d cpu -p 9000
+python server.py -m run_model.onnx -d cpu -p 9000
 ```
 
 | Flag | Default | Meaning |
 | --- | --- | --- |
-| `-m`, `--model` | `run_model.onnx` | Restoration model file name |
+| `-m`, `--model` | `run_model_fp16.onnx` | Restoration model file name |
 | `-d`, `--device` | `cuda` | `cuda` or `cpu` |
-| `--max_side` | `1920` | Images with a longer side than this are downscaled before inference |
+| `--max_side` | `1280` | Images with a longer side than this are downscaled before inference |
 | `--host` | `0.0.0.0` | Bind address |
 | `-p`, `--port` | `8080` | Bind port |
 
@@ -78,7 +78,7 @@ curl http://127.0.0.1:8080/api/health/
 ```
 
 ```json
-{"status": "ok", "model": "run_model.onnx", "device": "cuda", "max_side": 1920,
+{"status": "ok", "model": "run_model_fp16.onnx", "device": "cuda", "max_side": 1280,
  "providers": ["CUDAExecutionProvider", "CPUExecutionProvider"]}
 ```
 
@@ -104,7 +104,7 @@ curl -X POST -F "image=@test_images/a.png" http://127.0.0.1:8080/api/restore/ -o
 ## Docker
 
 Base image `nvidia/cuda:12.6.3-cudnn-runtime-ubuntu24.04`, so run it with `--gpus all`.
-`checkpoints/` is not baked into the image (~540 MB of onnx) -- mount it at run time.
+`checkpoints/` is not baked into the image (~520 MB of onnx) -- mount it at run time.
 
 ```bash
 docker build -t imagerestoration-server .
@@ -114,7 +114,7 @@ docker run --gpus all -p 8080:8080 -v ./checkpoints:/app/checkpoints imagerestor
 Server flags pass straight through the entrypoint:
 
 ```bash
-docker run --gpus all -p 8080:8080 -v ./checkpoints:/app/checkpoints imagerestoration-server -m run_model_fp16.onnx --max_side 1280
+docker run --gpus all -p 8080:8080 -v ./checkpoints:/app/checkpoints imagerestoration-server -m run_model.onnx --max_side 1920
 ```
 
 Omit `--gpus all` and pass `-d cpu` to run on CPU. On Windows use an absolute path for
@@ -145,10 +145,10 @@ python test.py test_images/a.png
 ```
 
 ```
-[PASS] health -- 6ms -- {'status': 'ok', 'model': 'run_model.onnx', ...}
-[PASS] restore -- 2089ms -- (450, 298, 3) -> (450, 298, 3)
+[PASS] health -- 4ms -- {'status': 'ok', 'model': 'run_model_fp16.onnx', ...}
+[PASS] restore -- 4145ms -- (450, 298, 3) -> (450, 298, 3)
        wrote test_images/a_out.png
-[PASS] rejects a non-image -- 3ms -- 400 {"detail":"could not decode image"}
+[PASS] rejects a non-image -- 4ms -- 400 {"detail":"could not decode image"}
 3/3 checks passed
 ```
 
@@ -205,8 +205,9 @@ only -- the endpoint adds PNG decode and encode on top.
 - ONNX sessions are created at startup and shared. FastAPI runs the endpoint in a
   threadpool, so concurrent requests are correct but throughput is bounded by the
   session a request runs on.
-- The fp16 graph is selected by name: `--model run_model_fp16.onnx`. It halves the
-  weights on disk; the class reads the dtype from the graph and feeds it half input.
+- The default is the fp16 graph, which halves the weights on disk; the class reads the
+  dtype from the graph and feeds it half input. The fp32 one is selected by name:
+  `--model run_model.onnx`.
 - The restorer rounds each side to a multiple of 16, so the graph never sees the exact
   input size. The endpoint resizes the result back, which is why the response matches
   the upload while `onnx_inference.py` writes the rounded size.
