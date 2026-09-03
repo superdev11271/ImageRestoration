@@ -35,6 +35,7 @@ output = restorer.inference(cv2.imread('input.png'))         # BGR uint8 in, BGR
 outputs = restorer.infer_batch([img1, img2])                 # one session call per distinct size
 ```
 
+- fp32 and fp16 models are both supported; the input dtype is read from the model.
 - `device` is `'cuda'` (default) or `'cpu'`; `'cuda'` falls back to CPU when no CUDA
   execution provider is available.
 - Both sides are rounded to a multiple of 16 before inference, so the class returns
@@ -47,7 +48,7 @@ outputs = restorer.infer_batch([img1, img2])                 # one session call 
 
 ```bash
 python server.py
-python server.py -m run_model.onnx -d cpu -p 9000
+python server.py -m run_model_fp16.onnx -d cpu -p 9000
 ```
 
 | Flag | Default | Meaning |
@@ -103,7 +104,7 @@ curl -X POST -F "image=@test_images/a.png" http://127.0.0.1:8080/api/restore/ -o
 ## Docker
 
 Base image `nvidia/cuda:12.6.3-cudnn-runtime-ubuntu24.04`, so run it with `--gpus all`.
-`checkpoints/` is not baked into the image (~360 MB of onnx) -- mount it at run time.
+`checkpoints/` is not baked into the image (~540 MB of onnx) -- mount it at run time.
 
 ```bash
 docker build -t imagerestoration-server .
@@ -113,7 +114,7 @@ docker run --gpus all -p 8080:8080 -v ./checkpoints:/app/checkpoints imagerestor
 Server flags pass straight through the entrypoint:
 
 ```bash
-docker run --gpus all -p 8080:8080 -v ./checkpoints:/app/checkpoints imagerestoration-server -d cpu --max_side 1280
+docker run --gpus all -p 8080:8080 -v ./checkpoints:/app/checkpoints imagerestoration-server -m run_model_fp16.onnx --max_side 1280
 ```
 
 Omit `--gpus all` and pass `-d cpu` to run on CPU. On Windows use an absolute path for
@@ -151,8 +152,8 @@ python test.py test_images/a.png
 3/3 checks passed
 ```
 
-Those times are from a CPU run on this sample; `--device cuda` gives very
-different numbers.
+Those times are from a CPU run on this sample; `--device cuda` and the fp16 graph
+give very different numbers.
 
 | Flag | Default | Meaning |
 | --- | --- | --- |
@@ -182,11 +183,30 @@ curl -s -o /dev/null -w '%{http_code}\n' -X POST -F "image=@README.md" http://12
 # 400
 ```
 
+### Inference time
+
+`OnnxImageRestorer.inference()` on `test_images/a.png` (450x298), mean of 10 runs
+after 3 warmup runs, on an RTX 4070:
+
+| Model | Device | Provider | Mean | Std | Min | Max |
+| --- | --- | --- | --- | --- | --- | --- |
+| `run_model.onnx` | cuda | CUDAExecutionProvider | 70.7ms | 0.5ms | 69.9ms | 71.7ms |
+| `run_model.onnx` | cpu | CPUExecutionProvider | 1867.0ms | 43.6ms | 1821.2ms | 1961.4ms |
+| `run_model_fp16.onnx` | cuda | CUDAExecutionProvider | 47.2ms | 1.0ms | 46.2ms | 49.9ms |
+| `run_model_fp16.onnx` | cpu | CPUExecutionProvider | 2579.6ms | 50.4ms | 2500.7ms | 2658.5ms |
+
+`--device cuda` is the difference that matters: ~26x on the fp32 graph. fp16 is then
+the faster graph on GPU (1.5x over fp32) but the slower one on CPU, which has no
+native half kernels, so the casts are pure overhead there. These are model times
+only -- the endpoint adds PNG decode and encode on top.
+
 ## Notes
 
 - ONNX sessions are created at startup and shared. FastAPI runs the endpoint in a
   threadpool, so concurrent requests are correct but throughput is bounded by the
   session a request runs on.
+- The fp16 graph is selected by name: `--model run_model_fp16.onnx`. It halves the
+  weights on disk; the class reads the dtype from the graph and feeds it half input.
 - The restorer rounds each side to a multiple of 16, so the graph never sees the exact
   input size. The endpoint resizes the result back, which is why the response matches
   the upload while `onnx_inference.py` writes the rounded size.
