@@ -1,0 +1,10 @@
+.git/
+__pycache__/
+*.pyc
+checkpoints/
+output/
+results/
+test_images/
+venv/
+Dockerfile
+.dockerignore
